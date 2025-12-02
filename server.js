@@ -1,152 +1,149 @@
 const express = require('express');
-const cors = require('cors'); // Moduł 'cors'
-const axios = require('axios');
-const qs = require('qs');
+const cors = require('cors');
+const dotenv = require('dotenv');
+const axios = require('axios'); // Odkomentowane - teraz potrzebujemy axios
+const qs = require('qs'); // qs jest przydatny, ale dla tej metody wystarczy URLSearchParams
 
-// Wczytywanie zmiennych środowiskowych z pliku .env w środowisku lokalnym
-// Na Render.com zmienne są automatycznie wstrzykiwane
-require('dotenv').config();
+// Wczytanie zmiennych środowiskowych (np. z pliku .env lub z Render.com)
+dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Klucze API
-const CLIENT_ID = process.env.FATSECRET_CLIENT_ID;
-const CLIENT_SECRET = process.env.FATSECRET_CLIENT_SECRET;
-
-// Adresy API FatSecret
-const TOKEN_URL = 'https://oauth.fatsecret.com/connect/token';
-const SEARCH_URL = 'https://platform.fatsecret.com/rest/server.api';
-
-// Włączanie CORS dla wszystkich domen
+// Konfiguracja CORS
 app.use(cors());
-
-// Middleware do parsowania JSON w ciele żądania
+// Middleware do parsowania JSON (ponieważ Swift wysyła POST z JSON)
 app.use(express.json());
 
-// Prosta ścieżka testowa
-app.get('/', (req, res) => {
-    res.status(200).send('FatSecret Nutrition Proxy is running.');
-});
+// --- Konfiguracja FatSecret ---
+const FATSECRET_CLIENT_ID = process.env.FATSECRET_CLIENT_ID;
+const FATSECRET_CLIENT_SECRET = process.env.FATSECRET_CLIENT_SECRET;
+const FATSECRET_TOKEN_URL = 'https://oauth.fatsecret.com/connect/token';
+const FATSECRET_API_URL = 'https://platform.fatsecret.com/rest/server.api';
+
+// Zmienne do przechowywania tokena w pamięci
+let accessToken = null;
+let tokenExpiry = 0;
 
 /**
- * Krok 1: Pobiera token dostępu OAuth 2.0 od FatSecret.
+ * Funkcja pomocnicza: Pobiera (lub odświeża) token dostępu OAuth 2.0
  */
 async function getAccessToken() {
-    if (!CLIENT_ID || !CLIENT_SECRET) {
-        throw new Error("FATSECRET_CLIENT_ID lub FATSECRET_CLIENT_SECRET nie są ustawione w zmiennych środowiskowych.");
+    // Sprawdź, czy token istnieje i jest ważny (z 60-sekundowym buforem)
+    if (accessToken && Date.now() < tokenExpiry - 60000) {
+        return accessToken;
     }
-    
-    const tokenData = qs.stringify({
-        grant_type: 'client_credentials',
-        scope: 'basic'
-    });
+
+    if (!FATSECRET_CLIENT_ID || !FATSECRET_CLIENT_SECRET) {
+        console.error("BŁĄD KRYTYCZNY: Brak FATSECRET_CLIENT_ID lub FATSECRET_CLIENT_SECRET w zmiennych środowiskowych.");
+        throw new Error("Brak konfiguracji API po stronie serwera.");
+    }
+
+    console.log("Pobieranie nowego tokena dostępu FatSecret...");
+
+    // Używamy URLSearchParams do formatu x-www-form-urlencoded
+    const params = new URLSearchParams();
+    params.append('grant_type', 'client_credentials');
+    params.append('scope', 'basic'); // 'basic' wystarczy do metody recipe.nutrition.v1
+
+    const headers = {
+        'Authorization': 'Basic ' + Buffer.from(`${FATSECRET_CLIENT_ID}:${FATSECRET_CLIENT_SECRET}`).toString('base64'),
+        'Content-Type': 'application/x-www-form-urlencoded'
+    };
 
     try {
-        const response = await axios.post(TOKEN_URL, tokenData, {
-            headers: {
-                'Authorization': `Basic ${Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64')}`,
-                'Content-Type': 'application/x-www-form-urlencoded'
-            }
-        });
-        
-        return response.data.access_token;
+        const response = await axios.post(FATSECRET_TOKEN_URL, params, { headers });
+        accessToken = response.data.access_token;
+        tokenExpiry = Date.now() + (response.data.expires_in * 1000);
+        console.log("Pomyślnie uzyskano nowy token.");
+        return accessToken;
     } catch (error) {
-        console.error('Błąd pobierania tokena FatSecret:', error.response?.data || error.message);
-        throw new Error('Nie udało się pobrać tokena dostępu z FatSecret.');
+        console.error("Błąd podczas uzyskiwania tokena FatSecret:", error.response?.data || error.message);
+        throw new Error("Nie można uwierzytelnić się w FatSecret.");
     }
 }
 
+
 /**
- * Krok 2: Pobiera informacje odżywcze z FatSecret.
+ * Główny Endpoint: /api/nutrition
+ * Metoda: POST (zgodnie z wywołaniem Swift)
+ * Oczekuje: { "ingredients": ["...", "..."], "servings": X }
  */
 app.post('/api/nutrition', async (req, res) => {
-    const { ingredients, servings } = req.body;
+    
+    // POPRAWKA: Zmiana z req.query na req.body
+    const { ingredients, servings } = req.body; 
+    
+    console.log(`Odebrano zapytanie dla: ${ingredients ? ingredients.length : 0} składników.`);
 
     if (!ingredients || !Array.isArray(ingredients) || ingredients.length === 0) {
-        return res.status(400).json({ error: "Brak listy składników ('ingredients') w ciele żądania." });
-    }
-
-    if (typeof servings !== 'number' || servings <= 0) {
-        return res.status(400).json({ error: "Nieprawidłowa wartość 'servings'." });
-    }
-
-    let accessToken;
-    try {
-        accessToken = await getAccessToken();
-    } catch (error) {
-        return res.status(500).json({ error: error.message });
+        return res.status(400).json({ error: "Brak 'ingredients' w ciele (body) żądania." });
     }
     
-    // Zsumowane wartości odżywcze
-    let totalCalories = 0;
-    let totalFat = 0;
-    let totalCarbohydrates = 0;
-    let totalProtein = 0;
-    
-    // Używamy Promise.all do równoległego przetwarzania zapytań
+    // Ustawienie domyślnej liczby porcji na 1, jeśli nie podano
+    const numServings = servings || 1;
+
     try {
-        const searchPromises = ingredients.map(async (ingredientString) => {
-            console.log(`Wyszukiwanie: ${ingredientString}`);
-            
-            const params = {
-                method: 'food.find_id_for_serving_phrase',
-                phrase: ingredientString,
-                format: 'json',
-                serving_phrase: ingredientString
-            };
+        // Krok 1: Zdobądź token dostępu
+        const token = await getAccessToken();
 
-            // Wymagany format FatSecret: application/x-www-form-urlencoded
-            const response = await axios.post(SEARCH_URL, qs.stringify(params), {
-                headers: {
-                    'Authorization': `Bearer ${accessToken}`,
-                    'Content-Type': 'application/x-www-form-urlencoded'
-                }
-            });
+        // Krok 2: Przygotuj parametry dla API FatSecret
+        // FatSecret oczekuje formatu x-www-form-urlencoded
+        const apiParams = new URLSearchParams();
+        apiParams.append('method', 'recipe.nutrition.v1');
+        apiParams.append('format', 'json');
+        apiParams.append('number_of_servings', numServings);
 
-            // Odpowiedź zawiera 'serving_phrase_id' i 'nutrition_per_serving'
-            const data = response.data;
-            
-            if (data.nutrition_per_serving) {
-                const nutrition = data.nutrition_per_serving;
-                
-                // Konwersja na liczby i sumowanie, ignorując 'fiber', 'sugar', 'sodium' itp.
-                totalCalories += parseFloat(nutrition.calories) || 0;
-                totalFat += parseFloat(nutrition.fat) || 0;
-                totalCarbohydrates += parseFloat(nutrition.carbohydrate) || 0;
-                totalProtein += parseFloat(nutrition.protein) || 0;
-            } else {
-                console.warn(`Ostrzeżenie: Nie znaleziono danych odżywczych dla: ${ingredientString}`);
-                // Możesz chcieć zwrócić błąd 400 jeśli żaden składnik nie został znaleziony
+        // FatSecret wymaga, aby tablica składników była stringiem JSON wewnątrz parametru 'recipe_ingredients'
+        const ingredientsPayload = JSON.stringify({
+            recipe_ingredients: {
+                // Używamy tablicy stringów 'ingredients' otrzymanej od Swift
+                ingredient_description: ingredients 
             }
         });
-        
-        await Promise.all(searchPromises);
-        
-        // Obliczanie wartości NA PORCJĘ
-        const caloriesPerServing = totalCalories / servings;
-        const fatPerServing = totalFat / servings;
-        const carbohydratesPerServing = totalCarbohydrates / servings;
-        const proteinPerServing = totalProtein / servings;
+        apiParams.append('recipe_ingredients', ingredientsPayload);
 
-        // Zwrot wyniku zgodny ze strukturą NutritionInfo z pliku Swift
-        res.json({
-            calories: caloriesPerServing,
-            fat: fatPerServing,
-            carbohydrates: carbohydratesPerServing,
-            protein: proteinPerServing
-        });
+        const apiHeaders = {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/x-www-form-urlencoded'
+        };
+
+        // Krok 3: Wywołaj API FatSecret
+        const nutritionResponse = await axios.post(FATSECRET_API_URL, apiParams.toString(), { headers: apiHeaders });
+
+        // Krok 4: Sparsuj odpowiedź z FatSecret
+        const nutritionData = nutritionResponse.data?.recipe_nutrition?.serving_nutrition;
+
+        if (!nutritionData) {
+            // Dzieje się tak, gdy FatSecret nie może znaleźć składników lub zwraca błąd
+            console.error("Błąd parsowania odpowiedzi FatSecret lub brak danych:", nutritionResponse.data);
+            return res.status(404).json({ error: 'Nie można obliczyć wartości odżywczych. Sprawdź składniki lub jednostki.' });
+        }
+
+        // Krok 5: Zmapuj odpowiedź FatSecret na format oczekiwany przez Swift
+        // (Ważne: FatSecret zwraca 'carbohydrate', a Swift oczekuje 'carbohydrates')
+        const appResponse = {
+            calories: parseFloat(nutritionData.calories) || 0,
+            fat: parseFloat(nutritionData.fat) || 0,
+            carbohydrates: parseFloat(nutritionData.carbohydrate) || 0, // Mapowanie
+            protein: parseFloat(nutritionData.protein) || 0
+        };
+
+        // Krok 6: Wyślij poprawną odpowiedź do aplikacji Swift
+        res.json(appResponse); 
 
     } catch (error) {
-        console.error('Główny błąd przetwarzania:', error.message);
-        const status = error.response?.status || 500;
-        const message = error.response?.data?.error?.message || 'Wewnętrzny błąd serwera podczas przetwarzania danych odżywczych.';
-        
-        res.status(status).json({ error: message });
+        console.error("Błąd podczas pobierania danych odżywczych:", error.response?.data || error.message);
+        res.status(500).json({ error: "Wewnętrzny błąd serwera podczas przetwarzania żądania." });
     }
 });
 
-// Uruchomienie serwera
+// Nasłuchiwanie na porcie
 app.listen(PORT, () => {
-    console.log(`Serwer proxy działa na porcie ${PORT}`);
+  console.log(`Serwer proxy działa na porcie ${PORT}`);
+});
+
+// Opcjonalnie: Uproszczony endpoint testowy (GET)
+app.get('/', (req, res) => {
+    res.send('Serwer proxy działa. Użyj [POST] /api/nutrition');
 });
