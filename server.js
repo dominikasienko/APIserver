@@ -1,30 +1,34 @@
 const express = require('express');
 const axios = require('axios');
 const app = express();
+// Używamy express.json() do parsowania przychodzącego JSON od aplikacji Swift
 app.use(express.json());
 
-// Konfiguracja kluczy (bez zmian - działa poprawnie)
+// --- Konfiguracja ---
+// Pamiętaj, aby ustawić te zmienne środowiskowe, aby proxy działał!
 const FATSECRET_CLIENT_ID = process.env.FATSECRET_CLIENT_ID; 
 const FATSECRET_CLIENT_SECRET = process.env.FATSECRET_CLIENT_SECRET;
-
+// --- Zmienne globalne do zarządzania tokenem ---
 let accessToken = null;
 let tokenExpiry = 0;
 
 /**
- * Endpoint zdrowia (bez zmian)
+ * Endpoint zdrowia
  */
 app.get('/', (req, res) => {
     res.status(200).send("FatSecret Nutrition Proxy Server is running and healthy. Endpoint for Nutrition calculation is POST /api/nutrition.");
 });
 
 /**
- * Pobieranie tokena (bez zmian - działa poprawnie)
+ * Funkcja pobierająca token dostępu OAuth 2.0 (Client Credentials Flow).
+ * Działa poprawnie i używa buforowania, aby nie pobierać nowego tokena przy każdym zapytaniu.
  */
 async function getAccessToken() {
     if (!FATSECRET_CLIENT_ID || !FATSECRET_CLIENT_SECRET) {
         throw new Error("FATSECRET_CLIENT_ID lub FATSECRET_CLIENT_SECRET nie są ustawione w zmiennych środowiskowych.");
     }
     
+    // Odśwież token, jeśli wygaśnie w ciągu najbliższej minuty
     if (accessToken && Date.now() < tokenExpiry - 60000) {
         return accessToken;
     }
@@ -36,6 +40,7 @@ async function getAccessToken() {
     params.append('scope', 'basic');
 
     const headers = {
+        // Autoryzacja Basic Base64(ID:SECRET)
         'Authorization': 'Basic ' + Buffer.from(`${FATSECRET_CLIENT_ID}:${FATSECRET_CLIENT_SECRET}`).toString('base64'),
         'Content-Type': 'application/x-www-form-urlencoded'
     };
@@ -53,83 +58,110 @@ async function getAccessToken() {
 }
 
 /**
- * Główny punkt końcowy (POPRAWIONY)
+ * Główny punkt końcowy API
+ * Przyjmuje: 
+ * - POST Body (JSON): { "ingredients": ["1 cup chicken breast", "50g onion"], "servings": 2 }
+ * Wysyła żądanie do metody 'recipe.nutrition.v1' API FatSecret.
  */
 app.post('/api/nutrition', async (req, res) => {
+    // Ustawienie timeoutu na 30 sekund na wypadek uśpienia serwera Render.com
     res.setTimeout(30000, () => { 
         res.status(503).json({ error: 'Błąd serwera: Przekroczono limit czasu oczekiwania na odpowiedź (Timeout).' });
     });
 
+    // Pobieramy dane z body żądania Swift
     const { ingredients, servings } = req.body;
 
     if (!ingredients || !Array.isArray(ingredients) || ingredients.length === 0) {
         return res.status(400).json({ error: 'Pole "ingredients" jest wymagane i musi być niepustą tablicą.' });
     }
     
+    // Używamy 1 jako domyślnej liczby porcji
     const numServings = servings || 1; 
 
     try {
         const token = await getAccessToken();
         
-        // --- POPRAWKA ---
-        // 1. Zmiana adresu URL na poprawny, stabilny endpoint
+        // --- KLUCZOWA POPRAWKA: WYSYŁANIE PRAWIDŁOWEGO ŻĄDANIA DO FATSECRET ---
         const apiUrl = 'https://platform.fatsecret.com/rest/server.api';
 
-        // 2. Zmiana formatu body na 'x-www-form-urlencoded' (URLSearchParams)
+        // FatSecret oczekuje formatu x-www-form-urlencoded dla wszystkich parametrów
         const params = new URLSearchParams();
+        
+        // 1. Ustawienie metody (co było powodem błędu "Unknown method")
         params.append('method', 'recipe.nutrition.v1');
-        params.append('format', 'json'); // Ważne: prosimy o JSON, nie XML
+        
+        // 2. Ustawienie formatu odpowiedzi na JSON
+        params.append('format', 'json'); 
+        
+        // 3. Ustawienie liczby porcji
         params.append('number_of_servings', numServings);
         
-        // 3. Składniki muszą być przekazane jako string JSON wewnątrz parametru
-        const ingredientsPayload = {
+        // 4. Składniki muszą być przekazane jako string JSON wewnątrz parametru 'recipe_ingredients'
+        // FatSecret wymaga specyficznej struktury:
+        const ingredientsPayload = JSON.stringify({
             recipe_ingredients: {
                 ingredient_description: ingredients
             }
-        };
-        params.append('recipe_ingredients', JSON.stringify(ingredientsPayload));
+        });
+        
+        params.append('recipe_ingredients', ingredientsPayload);
 
-        // 4. Zmiana nagłówka Content-Type
+        // 5. Ustawienie nagłówków (Bearer Token)
         const headers = {
             'Authorization': `Bearer ${token}`,
-            'Content-Type': 'application/x-www-form-urlencoded'
+            'Content-Type': 'application/x-www-form-urlencoded' // Wymagany dla body jako URLSearchParams
         };
 
-        // 5. Wysłanie żądania POST z nowymi parametrami
-        const nutritionResponse = await axios.post(apiUrl, params, { headers });
+        console.log(`Wysyłanie zapytania do FatSecret dla ${ingredients.length} składników...`);
         
-        // 6. Parsowanie odpowiedzi (struktura jest inna)
+        // Wysłanie żądania POST z URLSearchParams jako body
+        const nutritionResponse = await axios.post(apiUrl, params.toString(), { headers });
+        
+        // --- OBRÓBKA ODPOWIEDZI ---
+        // Odpowiedź API FatSecret jest zagnieżdżona pod `recipe_nutrition.serving_nutrition`
         const nutritionData = nutritionResponse.data?.recipe_nutrition?.serving_nutrition;
 
         if (!nutritionData) {
-            console.error("Błąd parsowania odpowiedzi FatSecret:", nutritionResponse.data);
-            return res.status(404).json({ error: 'Nie można obliczyć wartości odżywczych dla podanych składników (błąd parsowania odpowiedzi).' });
+            console.error("Błąd parsowania odpowiedzi FatSecret (brak 'serving_nutrition'):", nutritionResponse.data);
+            // Zwracamy błąd 404, jeśli API nie znalazło danych dla składników
+            if (nutritionResponse.data?.error?.code === 1) { // Kod błędu dla braku wyników w FatSecret
+                return res.status(404).json({ error: 'Brak danych odżywczych dla podanych składników.' });
+            }
+            return res.status(500).json({ error: 'Nie można obliczyć wartości odżywczych (błąd parsowania struktury odpowiedzi).' });
         }
 
-        // 7. Zmapowanie odpowiedzi na format oczekiwany przez Swift
-        // (nazwy pól są inne: 'carbohydrate' zamiast 'carbohydrates', 'fat' zamiast 'total_fat')
+        // Nazwy pól w odpowiedzi FatSecret to `carbohydrate` i `fat`.
+        // Mapujemy je na nazwy oczekiwane przez Twoją strukturę Swift (`carbohydrates` i `fat`).
         const appResponse = {
-            calories: parseFloat(nutritionData.calories),
-            fat: parseFloat(nutritionData.fat),
-            carbohydrates: parseFloat(nutritionData.carbohydrate), // Zmiana nazwy pola
-            protein: parseFloat(nutritionData.protein)
+            calories: parseFloat(nutritionData.calories) || 0,
+            // Nazwa w FatSecret to 'fat', co odpowiada Twojemu polu 'fat'
+            fat: parseFloat(nutritionData.fat) || 0,
+            // Nazwa w FatSecret to 'carbohydrate', a w Twoim Swift 'carbohydrates'
+            carbohydrates: parseFloat(nutritionData.carbohydrate) || 0, 
+            protein: parseFloat(nutritionData.protein) || 0
         };
-        // --- KONIEC POPRAWKI ---
 
         return res.status(200).json(appResponse);
 
     } catch (error) {
-        console.error("Błąd serwera proxy:", error.response?.data || error.message);
+        // Obsługa błędów, w tym błędów 401/403 z FatSecret, gdy token jest nieprawidłowy
+        const errorMessage = error.response?.data?.error?.message || error.response?.data?.error || error.message;
+        const statusCode = error.response?.status || 500;
         
-        if (error.response?.status === 401) {
-            return res.status(401).json({ error: 'Błąd uwierzytelnienia w FatSecret. Sprawdź klucze i token.' });
+        console.error(`Błąd serwera proxy (HTTP ${statusCode}):`, errorMessage);
+        
+        // Obsługa specyficznych kodów HTTP
+        if (statusCode === 401 || statusCode === 403) {
+            return res.status(401).json({ error: 'Błąd uwierzytelnienia (401/403) w FatSecret. Sprawdź klucze i token.' });
         }
         
+        // Obsługa timeoutu
         if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
             return res.status(504).json({ error: 'Błąd serwera: Żądanie do zewnętrznego API FatSecret przekroczyło limit czasu (Gateway Timeout).' });
         }
 
-        return res.status(500).json({ error: 'Wewnętrzny błąd serwera podczas przetwarzania żądania.' });
+        return res.status(statusCode).json({ error: `Wewnętrzny błąd serwera: ${errorMessage}` });
     }
 });
 
