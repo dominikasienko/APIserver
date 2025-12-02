@@ -1,5 +1,5 @@
 const express = require('express');
-const cors = require('cors'); // Teraz moduł 'cors' jest dostępny!
+const cors = require('cors'); // Moduł 'cors'
 const axios = require('axios');
 const qs = require('qs');
 
