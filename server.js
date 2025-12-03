@@ -7,7 +7,6 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // --- Używamy zmiennych ŚRODOWISKOWYCH ustawionych w panelu Render ---
-// Jeśli w Render użyłeś CLIENT_ID/SECRET, używamy tych nazw.
 const CLIENT_ID = process.env.FATSECRET_CLIENT_ID;
 const CLIENT_SECRET = process.env.FATSECRET_CLIENT_SECRET;
 
@@ -19,8 +18,7 @@ const NUTRITION_ENDPOINT_URL = NUTRITION_ENDPOINT_BASE + NUTRITION_ENDPOINT_PATH
 // Sprawdzanie kluczy
 if (!CLIENT_ID || !CLIENT_SECRET) {
     console.error("BŁĄD KONFIGURACJI: FATSECRET_CLIENT_ID lub FATSECRET_CLIENT_SECRET jest nieustawiony jako zmienna środowiskowa w Render.com.");
-    // Zamiast wychodzić z kodem błędu, który crashuje, startujemy serwer, ale z błędem auth.
-    // Dzięki temu, log błędu będzie widoczny w konsoli Render.
+    // Nie wychodzimy z błędem, aby serwer się podniósł i log był widoczny.
 }
 
 
@@ -29,6 +27,7 @@ let accessToken = null;
 let tokenExpiryTime = 0; // Timestamp (in ms) when the token expires
 
 // Middleware
+// Ustawienie większego limitu ciała żądania (dla żądań z 26 składnikami)
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));
 
@@ -38,8 +37,8 @@ app.use(express.json({ limit: '5mb' }));
 // -------------------------------------------------------------------
 
 async function getAccessToken() {
-    // Sprawdzenie, czy token jest ważny
-    if (accessToken && Date.now() < tokenExpiryTime - 60000) { // Zapas 60s
+    // Zapas 60s
+    if (accessToken && Date.now() < tokenExpiryTime - 60000) { 
         console.log("Używam istniejącego, ważnego tokenu.");
         return accessToken;
     }
@@ -185,18 +184,26 @@ app.post('/api/nutrition', async (req, res) => {
         if (data.result && data.result.nutrition_per_serving) {
             const nutrition = data.result.nutrition_per_serving;
 
+            // Zabezpieczenie: konwertujemy każdą wartość na liczbę zmiennoprzecinkową (Double)
+            // Używamy parseFloat() i zwracamy 0.0 w przypadku null/undefined/braku
+            const safeParse = (value) => {
+                const num = parseFloat(value);
+                return isNaN(num) ? 0.0 : num;
+            };
+
             const nutritionInfo = {
-                calories: nutrition.calories,
-                fat: nutrition.fat,
-                carbohydrates: nutrition.carbohydrate, // Poprawna nazwa pola w FatSecret
-                protein: nutrition.protein
+                // Konieczne jest użycie bezpiecznego parsowania, aby upewnić się, że Swift dostanie liczbę.
+                calories: safeParse(nutrition.calories),
+                fat: safeParse(nutrition.fat),
+                carbohydrates: safeParse(nutrition.carbohydrate), // Poprawna nazwa pola w FatSecret
+                protein: safeParse(nutrition.protein)
             };
 
             // 5. Odesłanie przetworzonych danych do aplikacji iOS
             return res.json(nutritionInfo);
         } else {
-            // Obsługa nieoczekiwanej struktury odpowiedzi (może się zdarzyć przy błędzie 400 z JSON)
-            console.error("Nieprawidłowa struktura odpowiedzi FatSecret:", data);
+            // Obsługa nieoczekiwanej struktury odpowiedzi 
+            console.error("Nieprawidłowa struktura odpowiedzi FatSecret lub brak danych odżywczych w 'nutrition_per_serving'.", data);
             return res.status(502).json({ 
                 error: "Nieprawidłowa struktura odpowiedzi z API FatSecret.",
                 details: data
