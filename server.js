@@ -1,164 +1,227 @@
-const express = require('express');
-const fetch = require('node-fetch');
-const cors = require('cors');
+import express from 'express';
+import fetch from 'node-fetch';
+import crypto from 'crypto'; // Moduł do generowania UUID
+import dotenv from 'dotenv';
+
+// Load environment variables from .env file
+dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const port = process.env.PORT || 3000;
 
-// Zmienne środowiskowe, które muszą być ustawione w Render.com
-const CLIENT_ID = process.env.FATSECRET_CLIENT_ID;
-const CLIENT_SECRET = process.env.FATSECRET_CLIENT_SECRET;
+// FatSecret API Configuration
+const FATSECRET_API_KEY = process.env.FATSECRET_API_KEY;
+const FATSECRET_API_SECRET = process.env.FATSECRET_API_SECRET;
 const TOKEN_URL = 'https://oauth.fatsecret.com/connect/token';
+const NUTRITION_ENDPOINT_BASE = 'https://platform.fatsecret.com';
+const NUTRITION_ENDPOINT_PATH = '/2.0/recipe/nutrition';
+const NUTRITION_ENDPOINT_URL = NUTRITION_ENDPOINT_BASE + NUTRITION_ENDPOINT_PATH;
 
-// --- KLUCZOWA POPRAWKA ADRESÓW URL ---
-// 1. Definiujemy BAZOWY URL API, ale TYLKO do autoryzacji
-const API_BASE_URL = 'https://platform.fatsecret.com'; 
+if (!FATSECRET_API_KEY || !FATSECRET_API_SECRET) {
+    console.error("FATSECRET_API_KEY or FATSECRET_API_SECRET is missing. Check your .env file.");
+    process.exit(1);
+}
 
-// 2. Definiujemy DOKŁADNY, PEŁNY URL dla obliczeń odżywczych (OAuth 2.0)
-// To jest poprawna ścieżka dla tej metody w nowym API
-const NUTRITION_ENDPOINT_URL = `${API_BASE_URL}/2.0/recipe/nutrition`; 
-// ------------------------------------
-
-// Stan tokenu
+// Global variable for the access token and its expiry time
 let accessToken = null;
-let tokenExpiryTime = 0; // Czas w milisekundach
+let tokenExpiryTime = 0; // Timestamp (in ms) when the token expires
 
-// Middleware
-app.use(cors());
-app.use(express.json({ limit: '5mb' }));
+// Middleware to parse JSON bodies
+app.use(express.json());
 
-// -------------------------------------------------------------------
-// 1. ZARZĄDZANIE AUTORYZACJĄ (OAuth 2.0)
-// -------------------------------------------------------------------
-
-async function getFatSecretToken() {
-    // Sprawdzenie, czy token jest nadal ważny (dajemy 60 sekund zapasu)
-    if (accessToken && Date.now() < tokenExpiryTime - 60000) {
-        console.log("Używam istniejącego tokenu.");
+/**
+ * Pobiera nowy token dostępu OAuth 2.0 (Client Credentials Grant).
+ * @returns {Promise<string>} Token dostępu.
+ */
+async function getAccessToken() {
+    // Sprawdzenie, czy token jest ważny
+    if (accessToken && Date.now() < tokenExpiryTime) {
+        console.log("Używam istniejącego, ważnego tokenu.");
         return accessToken;
     }
 
-    console.log("Odświeżam/Pobieram nowy token OAuth...");
-
-    if (!CLIENT_ID || !CLIENT_SECRET) {
-        console.error("Błąd: FATSECRET_CLIENT_ID lub FATSECRET_CLIENT_SECRET nie są ustawione.");
-        return null;
-    }
-
-    const authHeader = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64');
+    console.log("Pobieram/odświeżam nowy token dostępu...");
     
+    // Tworzenie nagłówka Authorization (Basic Base64(client_id:client_secret))
+    const credentials = Buffer.from(`${FATSECRET_API_KEY}:${FATSECRET_API_SECRET}`).toString('base64');
+
     try {
-        const tokenResponse = await fetch(TOKEN_URL, {
+        const response = await fetch(TOKEN_URL, {
             method: 'POST',
             headers: {
-                'Authorization': `Basic ${authHeader}`,
+                'Authorization': `Basic ${credentials}`,
                 'Content-Type': 'application/x-www-form-urlencoded'
             },
-            body: 'grant_type=client_credentials&scope=basic'
+            body: 'grant_type=client_credentials'
         });
 
-        if (!tokenResponse.ok) {
-            const errorText = await tokenResponse.text();
-            console.error(`Błąd podczas pobierania tokenu OAuth: ${tokenResponse.status} ${tokenResponse.statusText}. Odpowiedź: ${errorText}`);
-            return null;
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`Błąd FatSecret OAuth (${response.status}): ${errorText}`);
         }
 
-        const tokenData = await tokenResponse.json();
-        accessToken = tokenData.access_token;
-        tokenExpiryTime = Date.now() + (tokenData.expires_in * 1000);
+        const data = await response.json();
         
-        console.log("Pomyślnie uzyskano nowy token. Ważny do:", new Date(tokenExpiryTime).toLocaleString());
+        // Zapisanie nowego tokenu i ustawienie czasu wygaśnięcia
+        accessToken = data.access_token;
+        // Ustawienie wygaśnięcia na 5 minut przed faktycznym końcem (dla bezpieczeństwa)
+        tokenExpiryTime = Date.now() + (data.expires_in * 1000) - (5 * 60 * 1000); 
+
+        console.log("Token dostępu pomyślnie odświeżony.");
         return accessToken;
 
     } catch (error) {
-        console.error("Wyjątek podczas pobierania tokenu FatSecret:", error);
-        return null;
+        console.error("Krytyczny błąd podczas pobierania tokenu dostępu:", error.message);
+        // Resetowanie tokenu, aby wymusić ponowną próbę przy następnym wywołaniu
+        accessToken = null;
+        tokenExpiryTime = 0;
+        throw new Error("Błąd autoryzacji z FatSecret.");
     }
 }
 
-// -------------------------------------------------------------------
-// 2. LOGIKA PROXY DLA OBLICZANIA ODŻYWIANIA
-// -------------------------------------------------------------------
-
-// Endpoint testowy (GET)
-app.get('/', (req, res) => {
-    res.send('Serwer proxy działa. Użyj [POST] /api/nutrition');
-});
-
-// Główny endpoint proxy (POST)
-app.post('/api/nutrition', async (req, res) => {
-    const { ingredients, servings } = req.body;
-    
-    if (!ingredients || !Array.isArray(ingredients) || ingredients.length === 0) {
-        return res.status(400).json({ error: "Brak listy 'ingredients' w żądaniu." });
+/**
+ * Wykonuje żądanie do FatSecret API z obsługą tokenu.
+ * Wprowadzono logikę ponawiania prób w przypadku błędu 500/401, co sugeruje problem z tokenem.
+ * @param {object} payload - Ładunek JSON do wysłania do API.
+ * @param {boolean} isRetry - Flaga wskazująca, czy jest to ponowna próba po niepowodzeniu.
+ */
+async function callFatSecretApi(payload, isRetry = false) {
+    let token;
+    try {
+        // 1. Pobierz lub odśwież token
+        token = await getAccessToken();
+    } catch (authError) {
+        throw authError; // Wyrzuć błąd autoryzacji, jeśli nie udało się go uzyskać
     }
-
-    const token = await getFatSecretToken();
-    if (!token) {
-        return res.status(502).json({ error: "Nie udało się uzyskać tokenu autoryzacji FatSecret." });
-    }
-    
-    // Obiekt żądania FatSecret (jak w dokumentacji)
-    // UWAGA: Dla tego endpointu (API 2.0) używamy method: "recipe.get_nutrition"
-    const fatSecretPayload = {
-        method: "recipe.get_nutrition",
-        format: "json", // Żądamy formatu JSON
-        ingredients: ingredients,
-        servings: servings || 1 
-    };
-    
-    // --- ZMIENIONO LINIĘ LOGOWANIA, ABY POKAZAĆ POPRAWNY ENDPOINT ---
-    console.log(`Odebrano zapytanie dla: ${ingredients.length} składników. Wysyłanie żądania do ${NUTRITION_ENDPOINT_URL}...`);
 
     try {
-        // --- KLUCZOWA POPRAWKA: Używamy zdefiniowanej stałej NUTRITION_ENDPOINT_URL ---
+        // 2. Wykonaj żądanie do API
         const response = await fetch(NUTRITION_ENDPOINT_URL, {
             method: 'POST',
             headers: {
+                'Authorization': `Bearer ${token}`,
                 'Content-Type': 'application/json',
-                'Authorization': `Bearer ${token}`
+                // Upewniamy się, że API wie, że oczekujemy JSON
+                'Accept': 'application/json' 
             },
-            body: JSON.stringify(fatSecretPayload)
+            body: JSON.stringify(payload)
         });
-        // -------------------------------------------------------------------------
 
-        // Sprawdzenie, czy odpowiedź HTTP jest pomyślna
-        if (!response.ok) {
-            const responseText = await response.text();
-            
-            // Logowanie diagnostyczne
-            console.error(`BŁĄD ZWROTNY Z FATSECRET: Status: ${response.status} (${response.statusText})`);
-            
-            // Jeśli status to 401, token jest nieprawidłowy/wygasł
-            if (response.status === 401) {
-                accessToken = null; 
-                return res.status(401).json({ error: "Autoryzacja FatSecret nie powiodła się. Token może być nieprawidłowy/wygasły." });
-            }
-            
-            // Próbujemy sparsować błąd jako JSON, jeśli się nie uda, zwracamy ogólny błąd
-            try {
-                const errorJson = JSON.parse(responseText);
-                return res.status(500).json({ error: errorJson.error?.message || "Błąd serwera FatSecret." });
-            } catch {
-                // Jeśli nie da się sparsować na JSON (jak w przypadku błędu XML/HTML), zwracamy błąd 500
-                return res.status(500).json({ error: "FatSecret zwrócił nieoczekiwaną odpowiedź (nie JSON). Sprawdź logi FatSecret. Prawdopodobnie błąd składni żądania." });
-            }
+        // 3. Obsługa odpowiedzi
+        // Logowanie statusu, aby zdiagnozować błąd 500
+        console.log(`FatSecret API zwróciło status: ${response.status}`); 
+
+        if (response.ok) {
+            // Pomyślna odpowiedź 200 OK
+            return await response.json();
+        } 
+        
+        // Obsługa nieudanych odpowiedzi (np. 400, 401, 500)
+        const status = response.status;
+        const responseBodyText = await response.text();
+        
+        // 4. Obsługa błędu autoryzacji (401) lub błędu serwera (500)
+        if ((status === 401 || status === 500) && !isRetry) {
+            console.log(`Odebrano błąd ${status}. Resetuję token i ponawiam próbę...`);
+            // Resetowanie tokenu, aby wymusić jego odświeżenie
+            accessToken = null;
+            tokenExpiryTime = 0;
+            // Ponowienie próby
+            return callFatSecretApi(payload, true);
         }
 
-        // Parsowanie odpowiedzi (powinna być JSON)
-        const data = await response.json();
-        
-        // Zwracanie odpowiedzi do klienta mobilnego
-        res.json(data);
+        // 5. Obsługa błędów, które nie są rozwiązywane przez ponowienie
+        try {
+            // Spróbuj sparsować JSON błędu, jeśli FatSecret zwrócił go poprawnie (np. 400 Bad Request)
+            const errorJson = JSON.parse(responseBodyText);
+            throw new Error(`FatSecret API Błąd (${status}): ${JSON.stringify(errorJson)}`);
+        } catch (e) {
+            // Jeśli parsowanie JSON się nie powiodło (np. otrzymaliśmy HTML ze strony /error/500)
+            throw new Error(`Błąd FatSecret API (${status}): ${responseBodyText.substring(0, 100)}... (Brak poprawnego JSON błędu)`);
+        }
 
     } catch (error) {
+        // Błędy sieciowe (np. FetchError: invalid json response body)
         console.error("Błąd podczas komunikacji z API FatSecret:", error);
-        res.status(500).json({ error: "Błąd serwera proxy: Wewnętrzny błąd komunikacji." });
+        throw error;
+    }
+}
+
+
+// MAIN ROUTE
+app.post('/api/nutrition', async (req, res) => {
+    const ingredients = req.body.ingredients;
+
+    if (!ingredients || !Array.isArray(ingredients) || ingredients.length === 0) {
+        return res.status(400).json({ error: "Wymagana tablica 'ingredients' w ciele żądania." });
+    }
+
+    // 1. Stworzenie listy składników w formacie FatSecret
+    const recipeIngredients = ingredients.map((item, index) => ({
+        // Użycie unikalnego ID dla każdego składnika
+        ingredient_id: crypto.randomUUID(), 
+        food_entry: item
+    }));
+
+    // 2. Generowanie unikalnego ID dla posiłku (być może brak tego ID powodował błąd 500)
+    const mealId = crypto.randomUUID(); 
+
+    // 3. Konstruowanie ładunku do wysłania
+    const fatSecretPayload = {
+        // Wymagana metoda dla tego endpointu
+        method: "recipe.get_nutrition",
+        // Format, chociaż i tak wysyłamy JSON
+        format: "json", 
+        // Wymagane pola dla Recipe Nutrition API
+        meal_id: mealId, 
+        recipe_type: "any", // Można dostosować, ale 'any' jest bezpieczne
+        ingredients: recipeIngredients
+    };
+
+    console.log(`Odebrano zapytanie dla: ${ingredients.length} składników. Wysyłanie żądania do ${NUTRITION_ENDPOINT_URL}...`);
+    // console.log("Ładunek do FatSecret:", JSON.stringify(fatSecretPayload, null, 2)); // W razie problemów odkomentuj to!
+
+
+    try {
+        const data = await callFatSecretApi(fatSecretPayload);
+        
+        // 4. Przetwarzanie i walidacja odpowiedzi FatSecret
+        if (data.result && data.result.nutrition_per_serving) {
+            const nutrition = data.result.nutrition_per_serving;
+
+            // Ekstrakcja kluczowych danych odżywczych
+            const nutritionInfo = {
+                calories: nutrition.calories,
+                fat: nutrition.fat,
+                carbohydrates: nutrition.carbohydrate, // W FatSecret to 'carbohydrate', nie 'carbohydrates'
+                protein: nutrition.protein
+            };
+
+            // 5. Odesłanie przetworzonych danych do aplikacji iOS
+            return res.json(nutritionInfo);
+        } else {
+            // Obsługa nieoczekiwanej struktury odpowiedzi
+            console.error("Nieprawidłowa struktura odpowiedzi FatSecret:", data);
+            return res.status(502).json({ 
+                error: "Nieprawidłowa struktura odpowiedzi z API FatSecret.",
+                details: data
+            });
+        }
+    } catch (error) {
+        // Przechwycenie błędu z callFatSecretApi (autoryzacja, sieć, FatSecret)
+        const errorMessage = error.message || "Wystąpił nieznany błąd serwera.";
+        // Wysłanie błędu do klienta (iOS) z kodem 500
+        return res.status(500).json({ error: errorMessage });
     }
 });
 
-// Uruchomienie serwera
-app.listen(PORT, async () => {
-    console.log(`Serwer proxy działa na porcie ${PORT}`);
-    await getFatSecretToken();
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+    res.status(200).send('OK');
+});
+
+// Start the server
+app.listen(port, () => {
+    console.log(`Serwer proxy nasłuchuje na porcie ${port}`);
 });
