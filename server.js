@@ -1,26 +1,21 @@
 const express = require('express');
 const fetch = require('node-fetch');
-const crypto = require('crypto');
 const cors = require('cors');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// --- KONFIGURACJA ZMIENNYCH ŚRODOWISKOWYCH ---
-// Upewnij się, że w Render.com masz ustawione: FATSECRET_CLIENT_ID oraz FATSECRET_CLIENT_SECRET
+// === ZMIENNE ŚRODOWISKOWE ===
 const CLIENT_ID = process.env.FATSECRET_CLIENT_ID || process.env.FATSECRET_API_KEY;
 const CLIENT_SECRET = process.env.FATSECRET_CLIENT_SECRET;
 
 const TOKEN_URL = 'https://oauth.fatsecret.com/connect/token';
-const NUTRITION_ENDPOINT_BASE = 'https://platform.fatsecret.com';
-const NUTRITION_ENDPOINT_PATH = '/2.0/recipe/nutrition';
-const NUTRITION_ENDPOINT_URL = NUTRITION_ENDPOINT_BASE + NUTRITION_ENDPOINT_PATH;
+const NUTRITION_ENDPOINT_URL = 'https://platform.fatsecret.com/2.0/recipe/nutrition';
 
-// Middleware
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));
 
-// --- ZARZĄDZANIE TOKENEM OAUTH 2.0 ---
+// === TOKEN OAUTH 2.0 ===
 let accessToken = null;
 let tokenExpiryTime = 0;
 
@@ -30,11 +25,11 @@ async function getAccessToken() {
     }
 
     if (!CLIENT_ID || !CLIENT_SECRET) {
-        console.error("BŁĄD: Brak kluczy API (CLIENT_ID/SECRET).");
+        console.error("❌ BRAK API KEYS (CLIENT_ID / CLIENT_SECRET)");
         return null;
     }
 
-    console.log("Pobieranie nowego tokena OAuth...");
+    console.log("🔐 Pobieranie nowego tokena OAuth...");
     const credentials = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64');
 
     try {
@@ -47,31 +42,76 @@ async function getAccessToken() {
             body: 'grant_type=client_credentials&scope=basic'
         });
 
+        const text = await response.text();
+
         if (!response.ok) {
-            const txt = await response.text();
-            console.error(`Błąd Tokena: ${txt}`);
+            console.error("❌ Błąd pobierania tokena:", text);
             return null;
         }
 
-        const data = await response.json();
+        const data = JSON.parse(text);
         accessToken = data.access_token;
-        tokenExpiryTime = Date.now() + (data.expires_in * 1000);
+        tokenExpiryTime = Date.now() + data.expires_in * 1000;
+
+        console.log("✅ Token pobrany.");
         return accessToken;
-    } catch (error) {
-        console.error("Wyjątek Tokena:", error);
+
+    } catch (err) {
+        console.error("❌ Wyjątek tokena:", err);
         return null;
     }
 }
 
-// --- FUNKCJA POMOCNICZA: BEZPIECZNA LICZBA ---
-const ensureDouble = (value) => {
-    if (value === null || value === undefined || value === "" || !isFinite(Number(value))) {
-        return 0.0;
-    }
-    return Number(value);
-};
+// === POMOCNICZA KONWERSJA LICZB ===
+const ensureDouble = (val) =>
+    !val || isNaN(Number(val)) ? 0.0 : Number(val);
 
-// --- GŁÓWNY ENDPOINT ---
+// === FUNKCJA: REQUEST DO FATSECRET Z RETRY ===
+async function fetchWithRetry(ingredient, token, retries = 3) {
+    const payload = {
+        ingredients: [
+            { ingredient_description: ingredient }
+        ]
+    };
+
+    for (let i = 0; i < retries; i++) {
+        try {
+            const response = await fetch(NUTRITION_ENDPOINT_URL, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${token}`,
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json'
+                },
+                body: JSON.stringify(payload)
+            });
+
+            const text = await response.text();
+
+            if (!response.ok) {
+                console.error(`❌ FatSecret error ${response.status}:`, text);
+
+                // Retry only for server errors
+                if (response.status >= 500) {
+                    console.log("⏳ Retry za 500ms...");
+                    await new Promise((r) => setTimeout(r, 500));
+                    continue;
+                }
+                return null;
+            }
+
+            return JSON.parse(text);
+
+        } catch (err) {
+            console.error("❌ Błąd połączenia:", err);
+            await new Promise((r) => setTimeout(r, 500));
+        }
+    }
+
+    return null;
+}
+
+// === GŁÓWNY ENDPOINT ===
 app.post('/api/nutrition', async (req, res) => {
     const { ingredients, servings } = req.body;
 
@@ -79,82 +119,57 @@ app.post('/api/nutrition', async (req, res) => {
         return res.status(400).json({ error: "Brak składników." });
     }
 
-    // Pobieramy liczbę porcji (domyślnie 1, jeśli błędna)
     const servingsCount = ensureDouble(servings) > 0 ? ensureDouble(servings) : 1.0;
 
-    // 1. Autoryzacja
     const token = await getAccessToken();
     if (!token) {
         return res.status(500).json({ error: "Błąd autoryzacji serwera proxy." });
     }
 
-    // 2. Przygotowanie danych dla FatSecret (JSON)
-    // POPRAWKA: Używamy 'ingredient_description' zamiast 'food_entry'
-    // POPRAWKA: Usunięto 'ingredient_id' (string UUID powodował błąd 500)
-    const recipeIngredients = ingredients.map((item) => ({
-        ingredient_description: item 
-    }));
+    console.log(`🍲 Otrzymano składniki: ${ingredients.length} szt. / porcje ${servingsCount}`);
+    console.log("📦 Składniki:", ingredients);
 
-    const payload = {
-        method: "recipe.get_nutrition",
-        format: "json",
-        ingredients: recipeIngredients
+    // === 🚀 RÓWNOLEGŁE REQUESTY WSZYSTKICH SKŁADNIKÓW ===
+    const results = await Promise.all(
+        ingredients.map(ing => fetchWithRetry(ing, token))
+    );
+
+    // === SUMOWANIE WYNIKÓW ===
+    let sum = { calories: 0, fat: 0, carbohydrates: 0, protein: 0 };
+
+    results.forEach((r, idx) => {
+        if (!r || !r.result || !r.result.nutrition_per_serving) {
+            console.warn(`⚠️ Brak danych dla składnika: ${ingredients[idx]}`);
+            return;
+        }
+
+        const n = r.result.nutrition_per_serving;
+        sum.calories += ensureDouble(n.calories);
+        sum.fat += ensureDouble(n.fat);
+        sum.carbohydrates += ensureDouble(n.carbohydrate);
+        sum.protein += ensureDouble(n.protein);
+    });
+
+    // === PRZELICZENIE NA PORCJĘ ===
+    const perServing = {
+        calories: sum.calories / servingsCount,
+        fat: sum.fat / servingsCount,
+        carbohydrates: sum.carbohydrates / servingsCount,
+        protein: sum.protein / servingsCount
     };
 
-    console.log(`[Proxy] Żądanie dla ${ingredients.length} składników. Dzielenie przez ${servingsCount} porcji.`);
+    console.log(`✅ Zwracam: ${perServing.calories.toFixed(0)} kcal / porcję`);
 
-    try {
-        // 3. Wywołanie API FatSecret (POST JSON)
-        const response = await fetch(NUTRITION_ENDPOINT_URL, {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${token}`,
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify(payload)
-        });
-
-        if (!response.ok) {
-            const errText = await response.text();
-            console.error(`FatSecret Error (${response.status}): ${errText}`);
-            return res.status(502).json({ error: "Błąd zewnętrznego API." });
-        }
-
-        const data = await response.json();
-
-        // 4. Przetwarzanie wyniku
-        if (data.result && data.result.nutrition_per_serving) {
-            const raw = data.result.nutrition_per_serving;
-
-            const totalCalories = ensureDouble(raw.calories);
-            const totalFat = ensureDouble(raw.fat);
-            const totalCarbs = ensureDouble(raw.carbohydrate);
-            const totalProtein = ensureDouble(raw.protein);
-
-            const result = {
-                calories: totalCalories / servingsCount,
-                fat: totalFat / servingsCount,
-                carbohydrates: totalCarbs / servingsCount,
-                protein: totalProtein / servingsCount
-            };
-
-            console.log(`[Proxy] Sukces. Wynik na porcję: ${result.calories.toFixed(0)} kcal`);
-            return res.json(result);
-        } else {
-            console.warn("FatSecret nie zwrócił nutrition_per_serving:", data);
-            return res.json({ calories: 0, fat: 0, carbohydrates: 0, protein: 0 });
-        }
-
-    } catch (error) {
-        console.error("Proxy Exception:", error);
-        return res.status(500).json({ error: error.message });
-    }
+    res.json(perServing);
 });
 
-app.get('/', (req, res) => res.send("Proxy działa. Użyj POST /api/nutrition"));
+// === ROOT ===
+app.get('/', (req, res) =>
+    res.send("Proxy działa. Użyj POST /api/nutrition")
+);
 
+// === START SERWERA ===
 app.listen(PORT, () => {
-    // SZUKAJ TEGO KOMUNIKATU W LOGACH RENDER, ABY POTWIERDZIĆ AKTUALIZACJĘ:
-    console.log(`>> SERWER WERSJA: OAUTH 2.0 POPRAWIONA STRUKTURA (PORT ${PORT}) <<`);
-    getAccessToken(); // Inicjalne pobranie tokena
+    console.log(`🚀 Proxy działa na porcie ${PORT}`);
+    getAccessToken();
 });
