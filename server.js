@@ -1,209 +1,259 @@
-// server.js — Full rewritten version with:
-// - Parallel ingredient lookups
-// - Combined nutrient merging
-// - Auto-scaling for servings
-// - FatSecret OAuth token caching
-// - Full error reporting
-// - Clean async/await pipeline
-
 import express from "express";
-import fetch from "node-fetch";
 import cors from "cors";
+import fetch from "node-fetch";
 
 const app = express();
-app.use(express.json());
 app.use(cors());
+app.use(express.json());
 
-// ---------------------------------------------------------------------------
+// =======================
 // CONFIG
-// ---------------------------------------------------------------------------
-const FATSECRET_CLIENT_ID = process.env.FATSECRET_CLIENT_ID;
-const FATSECRET_CLIENT_SECRET = process.env.FATSECRET_CLIENT_SECRET;
+// =======================
+const FATSECRET_ENDPOINT = "https://platform.fatsecret.com/rest/server.api";
+const EDAMAM_NUTRITION = "https://api.edamam.com/api/nutrition-data";
 
-if (!FATSECRET_CLIENT_ID || !FATSECRET_CLIENT_SECRET) {
-  console.error("❌ Missing FatSecret API credentials.");
-  process.exit(1);
-}
+const FS_CLIENT_ID = process.env.FATSECRET_CLIENT_ID;
+const FS_CLIENT_SECRET = process.env.FATSECRET_CLIENT_SECRET;
 
-// ---------------------------------------------------------------------------
-// OAUTH TOKEN CACHE
-// ---------------------------------------------------------------------------
-let fatSecretToken = null;
-let fatSecretTokenExpiresAt = 0;
+const EDAMAM_APP_ID = process.env.EDAMAM_APP_ID;
+const EDAMAM_APP_KEY = process.env.EDAMAM_APP_KEY;
 
-// Fetch OAuth2 token
-async function getFatSecretToken() {
-  const now = Date.now();
+// =======================
+// FATSECRET TOKEN
+// =======================
+let fatsecretToken = null;
+let tokenExpiresAt = 0;
 
-  // If token valid => reuse
-  if (fatSecretToken && now < fatSecretTokenExpiresAt) {
-    return fatSecretToken;
-  }
-
-  const credentials = Buffer.from(
-    `${FATSECRET_CLIENT_ID}:${FATSECRET_CLIENT_SECRET}`
-  ).toString("base64");
-
-  const res = await fetch("https://oauth.fatsecret.com/connect/token", {
-    method: "POST",
-    headers: {
-      Authorization: `Basic ${credentials}`,
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body: "grant_type=client_credentials&scope=basic",
-  });
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Token request failed: ${text}`);
-  }
-
-  const data = await res.json();
-  fatSecretToken = data.access_token;
-  fatSecretTokenExpiresAt = now + data.expires_in * 1000;
-
-  return fatSecretToken;
-}
-
-// ---------------------------------------------------------------------------
-// FATSECRET — SEARCH + GET NUTRITION
-// ---------------------------------------------------------------------------
-async function fetchIngredientNutrition(query) {
-  const token = await getFatSecretToken();
-
-  // 1) Search for food ID
-  const searchRes = await fetch(
-    `https://platform.fatsecret.com/rest/server.api?method=foods.search&search_expression=${encodeURIComponent(
-      query
-    )}&format=json`,
-    { headers: { Authorization: `Bearer ${token}` } }
-  );
-
-  const searchJson = await tryParseJSON(searchRes);
-  if (!searchJson?.foods?.food?.length) {
-    throw new Error(`No results for ingredient: ${query}`);
-  }
-
-  const foodId = searchJson.foods.food[0].food_id;
-
-  // 2) Fetch nutrition details
-  const detailRes = await fetch(
-    `https://platform.fatsecret.com/rest/server.api?method=food.get.v4&food_id=${foodId}&format=json`,
-    { headers: { Authorization: `Bearer ${token}` } }
-  );
-
-  const detailJson = await tryParseJSON(detailRes);
-  if (!detailJson.food) {
-    throw new Error(`FatSecret returned invalid data for: ${query}`);
-  }
-
-  return extractNutrition(detailJson.food);
-}
-
-// ---------------------------------------------------------------------------
-// SAFE JSON PARSER — avoids "Unexpected token '<' (HTML 500 errors)"
-// ---------------------------------------------------------------------------
-async function tryParseJSON(response) {
-  const text = await response.text();
-
-  try {
-    return JSON.parse(text);
-  } catch {
-    console.error("❌ FatSecret returned non-JSON response:");
-    console.error(text);
-    throw new Error("FatSecret API returned invalid JSON (likely HTML error page)");
-  }
-}
-
-// ---------------------------------------------------------------------------
-// EXTRACT NUTRITION (Normalized format)
-// ---------------------------------------------------------------------------
-function extractNutrition(food) {
-  const nutrients = food.servings.serving[0];
-
-  return {
-    name: food.food_name,
-    calories: Number(nutrients.calories ?? 0),
-    protein: Number(nutrients.protein ?? 0),
-    carbs: Number(nutrients.carbohydrate ?? 0),
-    fat: Number(nutrients.fat ?? 0),
-  };
-}
-
-// ---------------------------------------------------------------------------
-// MERGE MULTIPLE INGREDIENTS
-// ---------------------------------------------------------------------------
-function mergeNutrients(ingredients) {
-  return ingredients.reduce(
-    (sum, item) => ({
-      calories: sum.calories + item.calories,
-      protein: sum.protein + item.protein,
-      carbs: sum.carbs + item.carbs,
-      fat: sum.fat + item.fat,
-    }),
-    { calories: 0, protein: 0, carbs: 0, fat: 0 }
-  );
-}
-
-// ---------------------------------------------------------------------------
-// SERVING CALCULATOR
-// ---------------------------------------------------------------------------
-function scaleByServings(nutrients, servings) {
-  return {
-    calories: nutrients.calories / servings,
-    protein: nutrients.protein / servings,
-    carbs: nutrients.carbs / servings,
-    fat: nutrients.fat / servings,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// MAIN ENDPOINT — Parallel ingredients
-// ---------------------------------------------------------------------------
-app.post("/nutrition", async (req, res) => {
-  try {
-    const { ingredients, servings } = req.body;
-
-    if (!Array.isArray(ingredients) || ingredients.length === 0) {
-      return res.status(400).json({ error: "Provide ingredients: string[]" });
+async function getFatsecretToken() {
+    if (fatsecretToken && Date.now() < tokenExpiresAt) {
+        return fatsecretToken;
     }
 
-    const servingsCount = Number(servings || 1);
-
-    // Fetch all ingredients in parallel
-    const results = await Promise.all(
-      ingredients.map(async (item) => ({
-        name: item,
-        nutrients: await fetchIngredientNutrition(item),
-      }))
-    );
-
-    // Merge all nutrients
-    const combined = mergeNutrients(results.map((r) => r.nutrients));
-
-    // Auto-scale
-    const perServing = scaleByServings(combined, servingsCount);
-
-    res.json({
-      servings: servingsCount,
-      ingredients: results,
-      total: combined,
-      perServing: perServing,
+    const resp = await fetch("https://oauth.fatsecret.com/connect/token", {
+        method: "POST",
+        body: new URLSearchParams({
+            grant_type: "client_credentials",
+            scope: "basic",
+        }),
+        headers: {
+            Authorization:
+                "Basic " +
+                Buffer.from(`${FS_CLIENT_ID}:${FS_CLIENT_SECRET}`).toString("base64"),
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
     });
-  } catch (err) {
-    console.error("❌ SERVER ERROR:", err.message);
 
-    res.status(500).json({
-      error: "Nutrition fetch failed",
-      message: err.message,
+    const data = await resp.json();
+    fatsecretToken = data.access_token;
+    tokenExpiresAt = Date.now() + data.expires_in * 1000;
+    return fatsecretToken;
+}
+
+// =======================
+// UNIT CONVERSION HELPERS
+// =======================
+
+function gramsToTsp(g) {
+    return +(g * 0.175).toFixed(2); // sól & przyprawy
+}
+
+function gramsToTbsp(g) {
+    return +(g / 15).toFixed(2); // mąka, cukier, suche składniki
+}
+
+function mlToCups(ml) {
+    return +(ml / 240).toFixed(2);
+}
+
+function mlToTbsp(ml) {
+    return +(ml / 15).toFixed(2);
+}
+
+// Smart unit auto-conversion
+function convertIngredient(raw) {
+    // Example input: "6 g Salt"
+    const regex = /([\d.]+)\s*(g|gram|grams|ml|milliliter|milliliters)\s*(.*)/i;
+    const match = raw.match(regex);
+
+    if (!match) {
+        return raw; // No conversion needed
+    }
+
+    const qty = parseFloat(match[1]);
+    const unit = match[2].toLowerCase();
+    const name = match[3].trim().toLowerCase();
+
+    // Decide conversion strategy
+    if (unit === "g" || unit === "gram" || unit === "grams") {
+
+        // Salt, pepper, spices → tsp
+        if (name.includes("salt") || name.includes("pepper") || name.includes("spice")) {
+            return `${gramsToTsp(qty)} tsp ${name}`;
+        }
+
+        // oil → tbsp
+        if (name.includes("oil")) {
+            return `${gramsToTbsp(qty)} tbsp ${name}`;
+        }
+
+        // default → tbsp
+        return `${gramsToTbsp(qty)} tbsp ${name}`;
+    }
+
+    if (unit === "ml" || unit === "milliliter" || unit === "milliliters") {
+
+        // milk, vinegar, soy, juice, water → cups
+        if (
+            name.includes("milk") ||
+            name.includes("vinegar") ||
+            name.includes("soy") ||
+            name.includes("juice") ||
+            name.includes("water")
+        ) {
+            return `${mlToCups(qty)} cup ${name}`;
+        }
+
+        // default → tbsp
+        return `${mlToTbsp(qty)} tbsp ${name}`;
+    }
+
+    return raw;
+}
+
+// =======================
+// FATSECRET LOOKUP
+// =======================
+async function searchFatSecret(query) {
+    const token = await getFatsecretToken();
+
+    const url = `${FATSECRET_ENDPOINT}?method=foods.search&search_expression=${encodeURIComponent(
+        query
+    )}&format=json`;
+
+    const resp = await fetch(url, {
+        headers: {
+            Authorization: `Bearer ${token}`,
+        },
     });
-  }
+
+    const data = await resp.json();
+
+    if (!data.foods) return null;
+    if (!data.foods.food) return null;
+
+    const food = Array.isArray(data.foods.food)
+        ? data.foods.food[0]
+        : data.foods.food;
+
+    if (!food) return null;
+
+    return {
+        calories: parseFloat(food.food_description.match(/Calories: (\d+)/)?.[1] || 0),
+        fat: parseFloat(food.food_description.match(/Fat: ([\d.]+)/)?.[1] || 0),
+        carbs: parseFloat(food.food_description.match(/Carbs: ([\d.]+)/)?.[1] || 0),
+        protein: parseFloat(food.food_description.match(/Protein: ([\d.]+)/)?.[1] || 0),
+    };
+}
+
+// =======================
+// EDAMAM FALLBACK
+// =======================
+async function searchEdamam(query) {
+    const url = `${EDAMAM_NUTRITION}?app_id=${EDAMAM_APP_ID}&app_key=${EDAMAM_APP_KEY}&ingr=${encodeURIComponent(
+        query
+    )}`;
+
+    const resp = await fetch(url);
+    const data = await resp.json();
+
+    if (!data.totalNutrients) return null;
+
+    return {
+        calories: data.calories || 0,
+        fat: data.totalNutrients.FAT?.quantity || 0,
+        carbs: data.totalNutrients.CHOCDF?.quantity || 0,
+        protein: data.totalNutrients.PROCNT?.quantity || 0,
+    };
+}
+
+// =======================
+// MAIN MERGED ENDPOINT
+// =======================
+app.post("/api/nutrition", async (req, res) => {
+    try {
+        const { ingredients, servings } = req.body;
+
+        if (!ingredients || ingredients.length === 0) {
+            return res.status(400).json({ error: "No ingredients provided." });
+        }
+
+        const converted = ingredients.map(convertIngredient);
+
+        const results = await Promise.all(
+            converted.map(async (ing, index) => {
+                const fatsecret = await searchFatSecret(ing);
+
+                if (fatsecret) return fatsecret;
+
+                const edamam = await searchEdamam(ing);
+
+                if (edamam) return edamam;
+
+                console.warn(`⚠ No results for ingredient: ${ingredients[index]}`);
+
+                return {
+                    calories: 0,
+                    fat: 0,
+                    carbs: 0,
+                    protein: 0,
+                };
+            })
+        );
+
+        // Merge totals
+        const total = results.reduce(
+            (acc, cur) => ({
+                calories: acc.calories + cur.calories,
+                fat: acc.fat + cur.fat,
+                carbs: acc.carbs + cur.carbs,
+                protein: acc.protein + cur.protein,
+            }),
+            { calories: 0, fat: 0, carbs: 0, protein: 0 }
+        );
+
+        // Scale per serving
+        const divisor = Math.max(1, servings || 1);
+
+        const perServing = {
+            calories: total.calories / divisor,
+            fats: total.fat / divisor,
+            carbs: total.carbs / divisor,
+            protein: total.protein / divisor,
+        };
+
+        res.json({
+            success: true,
+            totalIngredients: ingredients.length,
+            nutrition: {
+                calories: perServing.calories,
+                totalWeight: null,
+                nutrients: {
+                    FAT: { label: "Fat", quantity: perServing.fats, unit: "g" },
+                    CHOCDF: { label: "Carbs", quantity: perServing.carbs, unit: "g" },
+                    PROCNT: { label: "Protein", quantity: perServing.protein, unit: "g" },
+                },
+            },
+        });
+    } catch (err) {
+        console.error("❌ SERVER ERROR:", err);
+        res.status(500).json({ error: "Server error", details: err.message });
+    }
 });
 
-// ---------------------------------------------------------------------------
-// SERVER START
-// ---------------------------------------------------------------------------
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 Nutrition proxy server running on port ${PORT}`);
-});
+// =======================
+// START SERVER
+// =======================
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () =>
+    console.log(`🚀 Nutrition proxy server running on port ${PORT}`)
+);
