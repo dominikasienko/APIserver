@@ -3,7 +3,7 @@ import express from "express";
 import cors from "cors";
 import fetch from "node-fetch";
 import crypto from "crypto";
-import LRU from "lru-cache"; // add to package.json deps
+import { LRUCache } from "lru-cache"; // add to package.json deps
 import Redis from "ioredis"; // optional - only used if REDIS_URL is set
 import { normalizeIngredients } from "./ingredientCorrector.js";
 
@@ -22,9 +22,9 @@ if (!EDAMAM_APP_ID || !EDAMAM_APP_KEY) {
 }
 
 // ---------- CACHE: in-memory LRU + optional Redis ----------
-const memoryCache = new LRU({
+const cache = new LRUCache({
   max: 500,
-  ttl: 1000 * 60 * 60 // 1 hour
+  ttl: 1000 * 60 * 60, // 1h cache
 });
 
 let redisClient = null;
