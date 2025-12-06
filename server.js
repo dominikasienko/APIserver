@@ -5,9 +5,16 @@ import fetch from "node-fetch";
 import crypto from "crypto";
 import { LRUCache } from "lru-cache";
 
+const express = require('express');
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "500kb" }));
+
+// --- ADD THIS BLOCK AT THE TOP ---
+app.use((req, res, next) => {
+  console.log(`Incoming request: ${req.method} ${req.path}`);
+  next();
+});
 
 // ---- ENV ----
 const EDAMAM_APP_ID = process.env.EDAMAM_APP_ID;
