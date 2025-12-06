@@ -18,7 +18,7 @@ function smartSplit(ingredient) {
   return [ingredient];
 }
 
-unction mergeNutrition(results) {
+function mergeNutrition(results) { 
   let totalCalories = 0;
   const nutrients = {};
 
@@ -118,4 +118,3 @@ router.post("/", async (req, res) => {
 });
 
 export default router;
-

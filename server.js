@@ -3,6 +3,7 @@ import cors from "cors";
 import fetch from "node-fetch";
 import crypto from "crypto";
 import { LRUCache } from "lru-cache";
+import { normalizeIngredients } from "./ingredientCorrector.js"; 
 
 const app = express();
 app.use(cors());
@@ -13,13 +14,6 @@ const EDAMAM_APP_KEY = process.env.EDAMAM_APP_KEY;
 
 if (!EDAMAM_APP_ID || !EDAMAM_APP_KEY) {
   console.error("Missing EDAMAM_APP_ID or EDAMAM_APP_KEY");
-}
-
-function normalizeIngredients(ingredients) {
-  return {
-    normalized: ingredients.map(i => i.trim()),
-    diagnostics: []
-  };
 }
 
 const cache = new LRUCache({
@@ -112,6 +106,7 @@ async function handleBatchAnalyze(req, res) {
       return res.status(400).json({ error: "ingredients must be array" });
     }
 
+    // Używa zaimportowanej, poprawnej funkcji normalizeIngredients
     const { normalized, diagnostics } = normalizeIngredients(rawIngredients);
 
     const key = cacheKeyFor(normalized, servings);
