@@ -1,7 +1,3 @@
-// ingredientCorrector.js
-// Smart ingredient normalizer / corrector
-// Exports: normalizeIngredients(rawIngredients: string[]) => { normalized: string[], diagnostics: [] }
-
 const SYNONYMS = {
   "apple cider vinegar": "vinegar",
   "acv": "vinegar",
@@ -21,7 +17,6 @@ const REMOVE_ADJECTIVES = [
   "fresh","raw","organic","smoked","thick","thin","large","small","extra","plain","unsweetened","chopped","sliced","diced","minced","shredded","grated"
 ];
 
-// unit maps (preserve mainly common cooking units)
 const UNIT_MAP = {
   "tbs": "tbsp",
   "tbspn": "tbsp",
@@ -50,7 +45,6 @@ const UNIT_MAP = {
   "lb": "lb",
 };
 
-// heuristics to choose unit that Edamam understands well
 function heuristicsForName(name) {
   const n = name.toLowerCase();
   if (n.includes("salt")||n.includes("pepper")||n.includes("spice")) return "tsp";
@@ -66,10 +60,9 @@ function cleanupName(rawName) {
   });
   s = s.replace(/\s+/g, " ").trim();
 
-  // synonyms
   for (const [k,v] of Object.entries(SYNONYMS)) {
     if (s.includes(k)) {
-      if (Array.isArray(v)) return v; // split into multiple
+      if (Array.isArray(v)) return v; 
       return v;
     }
   }
@@ -78,14 +71,10 @@ function cleanupName(rawName) {
 }
 
 function parseRawIngredient(raw) {
-  // Try patterns:
-  // "100 g soy milk", "1 cup rice", "1 tsp salt and pepper", "salt"
   raw = (raw ?? "").toString().trim();
   if (!raw) return null;
 
-  // handle "and" composite early: "1 pinch salt and pepper"
   if (/ and /i.test(raw)) {
-    // fallback: split on " and " but keep quantities for first only
     const firstMatch = raw.match(/^([\d./]+\s*\w*)\s+(.*)/);
     if (firstMatch) {
       const qtyToken = firstMatch[1];
@@ -93,17 +82,14 @@ function parseRawIngredient(raw) {
       const parts = namesPart.split(/\s+and\s+/i);
       return parts.map((p, idx) => {
         if (idx === 0) return `${qtyToken} ${p.trim()}`;
-        // for subsequent parts assume same small amount: use "1 ${heuristicUnit}" - but simpler: "1 ${heuristics}"
         const heuristicUnit = heuristicsForName(p) || "tsp";
         return `1 ${heuristicUnit} ${p.trim()}`;
       });
     } else {
-      // fallback split
       return raw.split(/\s+and\s+/i).map(p=>p.trim());
     }
   }
 
-  // numeric quantity + unit + name
   const fullMatch = raw.match(/^([\d./]+)\s*([a-zA-Z]+)?\s*(.+)$/);
   if (fullMatch) {
     const qty = fullMatch[1];
@@ -113,17 +99,14 @@ function parseRawIngredient(raw) {
     return [`${qty} ${unit} ${nameRaw}`.trim()];
   }
 
-  // just word(s)
   return [raw];
 }
 
 export function normalizeIngredients(rawIngredients) {
-  // returns { normalized: string[], diagnostics: {original, normalized, reason}[] }
   const normalized = [];
   const diagnostics = [];
 
   for (const raw of rawIngredients) {
-    // parse into one or multiple strings first
     const parsed = parseRawIngredient(raw);
     if (!parsed || parsed.length === 0) {
       diagnostics.push({ original: raw, normalized: null, reason: "unparsed" });
@@ -131,17 +114,14 @@ export function normalizeIngredients(rawIngredients) {
     }
 
     for (const p of parsed) {
-      // split into tokens to find name part
       const m = p.match(/^([\d./]+)?\s*([a-zA-Z]+)?\s*(.+)$/);
       let namePart = p;
       if (m) {
         namePart = m[3] || "";
       }
 
-      // cleanup / synonyms / remove adjectives
       const cleaned = cleanupName(namePart);
 
-      // If cleanup returned an array (split synonyms), handle
       if (Array.isArray(cleaned)) {
         for (const c of cleaned) {
           const rebuilt = p.replace(namePart, c);
@@ -157,7 +137,6 @@ export function normalizeIngredients(rawIngredients) {
     }
   }
 
-  // dedupe and preserve order
   const unique = [];
   const seen = new Set();
   for (const s of normalized) {

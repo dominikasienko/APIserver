@@ -1,30 +1,20 @@
-// server.js
 import express from "express";
 import cors from "cors";
 import fetch from "node-fetch";
 import crypto from "crypto";
 import { LRUCache } from "lru-cache";
 
-const express = require('express');
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "500kb" }));
 
-// --- ADD THIS BLOCK AT THE TOP ---
-app.use((req, res, next) => {
-  console.log(`Incoming request: ${req.method} ${req.path}`);
-  next();
-});
-
-// ---- ENV ----
 const EDAMAM_APP_ID = process.env.EDAMAM_APP_ID;
 const EDAMAM_APP_KEY = process.env.EDAMAM_APP_KEY;
 
 if (!EDAMAM_APP_ID || !EDAMAM_APP_KEY) {
-  console.error("❌ Missing EDAMAM_APP_ID or EDAMAM_APP_KEY");
+  console.error("Missing EDAMAM_APP_ID or EDAMAM_APP_KEY");
 }
 
-// ---- Simple ingredient passthrough ----
 function normalizeIngredients(ingredients) {
   return {
     normalized: ingredients.map(i => i.trim()),
@@ -32,7 +22,6 @@ function normalizeIngredients(ingredients) {
   };
 }
 
-// ---- Cache (memory only) ----
 const cache = new LRUCache({
   max: 500,
   ttl: 1000 * 60 * 60
@@ -54,7 +43,6 @@ async function setCached(key, value) {
   cache.set(key, value);
 }
 
-// ---- Edamam: nutrition-details (POST) ----
 async function callEdamamNutritionDetails(ingrArray) {
   const url = `https://api.edamam.com/api/nutrition-details?app_id=${EDAMAM_APP_ID}&app_key=${EDAMAM_APP_KEY}`;
 
@@ -85,7 +73,6 @@ async function callEdamamNutritionDetails(ingrArray) {
   return json;
 }
 
-// ---- Fallback: per-ingredient ----
 async function callEdamamNutritionDataForIngredient(ingredient) {
   const url = `https://api.edamam.com/api/nutrition-data?app_id=${EDAMAM_APP_ID}&app_key=${EDAMAM_APP_KEY}&nutrition-type=cooking&ingr=${encodeURIComponent(ingredient)}`;
   const resp = await fetch(url);
@@ -97,7 +84,6 @@ async function callEdamamNutritionDataForIngredient(ingredient) {
   return resp.json();
 }
 
-// ---- Utils ----
 function extractTotalsFromDetails(json) {
   const calories = json?.calories ?? 0;
   const totalWeight = json?.totalWeight ?? null;
@@ -111,7 +97,6 @@ function extractTotalsFromDetails(json) {
   return { calories, totalWeight, nutrients: mapped };
 }
 
-// ---- Endpoints ----
 app.get("/", (req, res) => {
   res.json({ ok: true, service: "Edamam Nutrition Proxy" });
 });
@@ -137,7 +122,6 @@ async function handleBatchAnalyze(req, res) {
       return res.json(cached);
     }
 
-    // ---------- Primary: nutrition-details ----------
     let details = null;
 
     try {
@@ -153,7 +137,6 @@ async function handleBatchAnalyze(req, res) {
       totals = extractTotalsFromDetails(details);
       rawResponse = { mode: "nutrition-details", response: details };
     } else {
-      // ---------- Fallback ----------
       const per = await Promise.all(
         normalized.map(async ing => {
           return await callEdamamNutritionDataForIngredient(ing);
@@ -216,7 +199,6 @@ async function handleBatchAnalyze(req, res) {
   }
 }
 
-// ---- Start ----
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`Edamam proxy listening on port ${PORT}`);

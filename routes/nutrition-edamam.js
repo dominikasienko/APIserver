@@ -1,19 +1,11 @@
-// routes/nutrition-edamam.js
 import express from "express";
 import axios from "axios";
 
 const router = express.Router();
 
-/**
- * Utility: Normalize ingredient strings.
- * Edamam works best when phrases like:
- *   "1 pinch salt and pepper"
- * become:
- *   ["1 pinch salt", "1 pinch pepper"]
- */
 function smartSplit(ingredient) {
   if (ingredient.toLowerCase().includes("salt and pepper")) {
-    const qty = ingredient.match(/^\d+(\.\d+)?/); // extract numeric quantity
+    const qty = ingredient.match(/^\d+(\.\d+)?/); 
     const num = qty ? qty[0] : "1";
     const unit = ingredient.replace(num, "").trim().split(" ")[0];
 
@@ -26,11 +18,7 @@ function smartSplit(ingredient) {
   return [ingredient];
 }
 
-
-/**
- * Utility: Merge nutrient data from multiple ingredient responses
- */
-function mergeNutrition(results) {
+unction mergeNutrition(results) {
   let totalCalories = 0;
   const nutrients = {};
 
@@ -59,9 +47,6 @@ function mergeNutrition(results) {
 }
 
 
-/**
- * MAIN ROUTE: POST /api/nutrition-edamam
- */
 router.post("/", async (req, res) => {
   try {
     const { ingredients, servings } = req.body;
@@ -84,7 +69,6 @@ router.post("/", async (req, res) => {
     const results = [];
     const notFound = [];
 
-    // === PROCESS INGREDIENTS ===
     for (const ing of normalizedIngredients) {
       try {
         const response = await axios.post(
@@ -96,9 +80,9 @@ router.post("/", async (req, res) => {
         results.push(response.data);
 
       } catch (err) {
-        console.log(`⚠️ Ingredient not found: ${ing}`);
+        console.log(`Ingredient not found: ${ing}`);
         notFound.push(ing);
-        continue; // skip and continue
+        continue; 
       }
     }
 
@@ -115,7 +99,6 @@ router.post("/", async (req, res) => {
       });
     }
 
-    // === MERGE & BUILD OUTPUT ===
     const merged = mergeNutrition(results);
 
     res.json({
